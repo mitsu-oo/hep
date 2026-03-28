@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from statistics import mean, pstdev
+from typing import Iterable
 
 from .data import Candle
 from .risk import RiskPolicy
@@ -103,23 +104,51 @@ def backtest(
 
 def optimize_strategy(
     candles: list[Candle],
-    short_windows: range = range(5, 25, 5),
-    long_windows: range = range(20, 101, 10),
+    short_windows: Iterable[int] = range(5, 25, 5),
+    long_windows: Iterable[int] = range(20, 101, 10),
+    profit_weight: float = 2.0,
+    risk_penalty: float = 1.0,
+    require_positive_sharpe: bool = True,
 ) -> BacktestResult:
+    if profit_weight <= 0:
+        raise ValueError("profit_weight must be > 0")
+    if risk_penalty < 0:
+        raise ValueError("risk_penalty must be >= 0")
+
+    def _score(result: BacktestResult) -> float:
+        return (result.total_return * profit_weight) + result.sharpe_like - (result.max_drawdown * risk_penalty)
+
     best: BacktestResult | None = None
+    best_positive: BacktestResult | None = None
+
     for short_w in short_windows:
         for long_w in long_windows:
             if long_w <= short_w:
                 continue
-            res = backtest(candles, StrategyConfig(short_w, long_w))
+            try:
+                res = backtest(candles, StrategyConfig(short_w, long_w))
+            except ValueError:
+                # Skip invalid combinations (e.g. candle series shorter than long window)
+                continue
+
             if best is None:
                 best = res
+                if res.sharpe_like > 0:
+                    best_positive = res
                 continue
-            score = res.sharpe_like - res.max_drawdown
-            best_score = best.sharpe_like - best.max_drawdown
-            if score > best_score:
+
+            if _score(res) > _score(best):
                 best = res
+            if res.sharpe_like > 0:
+                if best_positive is None:
+                    best_positive = res
+                elif _score(res) > _score(best_positive):
+                    best_positive = res
+
+    chosen = best_positive if require_positive_sharpe else best
 
     if best is None:
         raise ValueError("no valid parameter combinations")
-    return best
+    if chosen is None or (require_positive_sharpe and chosen.sharpe_like <= 0):
+        raise ValueError("could not find strategy with positive sharpe_like")
+    return chosen
